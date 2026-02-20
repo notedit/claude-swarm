@@ -1,0 +1,23 @@
+{
+  "name": "claude-swarm",
+  "version": "0.1.0",
+  "description": "Claude Swarm - Fly Machines Agent lifecycle management",
+  "main": "dist/orchestrator/orchestrator.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/orchestrator/orchestrator.js",
+    "dev": "tsc --watch"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/notedit/claude-swarm.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ioredis": "^5.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
