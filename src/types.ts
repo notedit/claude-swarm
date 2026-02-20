@@ -1,66 +1,41 @@
-// Shared type definitions for claude-swarm
-
-export interface HeartbeatPayload {
-  machine_id: string;
-  started_at: string; // Unix timestamp as string
-  status: "running" | "done" | "error";
-}
+// Shared type definitions for claude-swarm (Cloudflare Sandbox)
 
 export type AgentStatus = "running" | "done" | "error";
 
-export type KillReason = "task_done" | "heartbeat_lost" | "timeout";
+// Worker environment bindings (from wrangler.toml)
+export interface Env {
+  Sandbox: DurableObjectNamespace;
+  ANTHROPIC_API_KEY: string;
+}
 
-export interface FlyMachine {
-  id: string;
-  name: string;
-  state:
-    | "created"
-    | "starting"
-    | "started"
-    | "stopping"
-    | "stopped"
-    | "replacing"
-    | "destroying"
-    | "destroyed";
-  region: string;
-  instance_id: string;
-  private_ip: string;
-  config: FlyMachineConfig;
-  image_ref?: {
-    registry: string;
-    repository: string;
-    tag: string;
-    digest: string;
-  };
+// Stored in /app/inbox/{msgId}.json by the Worker
+export interface InboxMessage {
+  message_id: string;
+  content: string;
   created_at: string;
-  updated_at: string;
 }
 
-export interface FlyMachineConfig {
-  image: string;
-  auto_destroy?: boolean;
-  stop_config?: {
-    timeout: number;
-    signal: string;
-  };
-  restart?: {
-    policy: "no" | "always" | "on-failure";
-  };
-  guest?: {
-    cpu_kind: "shared" | "performance";
-    cpus: number;
-    memory_mb: number;
-  };
-  env?: Record<string, string>;
+// Stored in /app/outbox/{msgId}.json by the Agent
+export interface OutboxMessage {
+  message_id: string;
+  status: "done" | "error";
+  content?: string;
+  error?: string;
+  created_at: string;
 }
 
-export interface CreateMachineRequest {
-  name: string;
-  config: FlyMachineConfig;
+// A single conversation turn (stored in history.json)
+export interface ConversationTurn {
+  message_id: string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string;
 }
 
+// Session info returned by the API
 export interface SessionInfo {
   session_id: string;
-  machine_id: string;
   created_at: string;
+  status: AgentStatus;
+  message_count: number;
 }

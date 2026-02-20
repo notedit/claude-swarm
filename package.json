@@ -1,13 +1,13 @@
 {
   "name": "claude-swarm",
-  "version": "0.1.0",
-  "description": "Claude Swarm - Fly Machines Agent lifecycle management",
-  "main": "dist/orchestrator/orchestrator.js",
+  "version": "0.2.0",
+  "description": "Claude Swarm - Cloudflare Sandbox Agent lifecycle management with multi-turn support",
+  "main": "src/index.ts",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/orchestrator/orchestrator.js",
-    "start:server": "node dist/orchestrator/server.js",
-    "dev": "tsc --watch"
+    "dev": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
+    "start": "npm run build && wrangler dev"
   },
   "repository": {
     "type": "git",
@@ -16,10 +16,12 @@
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",
-    "ioredis": "^5.3.2"
+    "@cloudflare/sandbox": "^0.7.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.0.0",
     "@types/node": "^20.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "wrangler": "^4.0.0"
   }
 }

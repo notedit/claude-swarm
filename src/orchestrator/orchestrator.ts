@@ -1,203 +1,141 @@
-// Orchestrator - manages Agent sessions and Fly Machine lifecycle
-// Entry point for the orchestrator process.
+// Orchestrator — manages agent sessions via Cloudflare Sandbox SDK.
+// Creates sandboxes, dispatches messages, and tracks conversation state
+// using file-based IPC (inbox/outbox pattern).
 
-import Redis from "ioredis";
+import { getSandbox } from "@cloudflare/sandbox";
 import { config } from "../config";
-import { MachineReaper } from "./reaper";
 import type {
-  CreateMachineRequest,
-  FlyMachine,
+  Env,
   SessionInfo,
+  InboxMessage,
+  OutboxMessage,
+  ConversationTurn,
 } from "../types";
 
-const FLY_API_BASE = "https://api.machines.dev/v1";
-
 export class Orchestrator {
-  private redis: Redis;
-  private reaper: MachineReaper;
+  private env: Env;
 
-  constructor() {
-    this.redis = new Redis(config.redisUrl);
-    this.reaper = new MachineReaper();
+  constructor(env: Env) {
+    this.env = env;
   }
 
-  /** Start the orchestrator and its background reaper */
-  start(): void {
-    this.reaper.start();
-    console.log("[orchestrator] started");
-  }
+  /** Initialize a new session sandbox */
+  async createSession(sessionId: string): Promise<SessionInfo> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId, {
+      sleepAfter: config.sandboxSleepAfter,
+    });
 
-  /** Gracefully shut down */
-  async close(): Promise<void> {
-    await this.reaper.close();
-    await this.redis.quit();
-    console.log("[orchestrator] stopped");
+    // Keep sandbox alive during active session
+    await sandbox.setKeepAlive(true);
+
+    // Create inbox/outbox directories
+    await sandbox.mkdir(config.paths.inbox, { recursive: true });
+    await sandbox.mkdir(config.paths.outbox, { recursive: true });
+
+    // Initialize empty conversation history
+    await sandbox.writeFile(config.paths.history, JSON.stringify([]));
+
+    // Set agent environment variables
+    await sandbox.setEnvVars({
+      ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY ?? "",
+      SESSION_ID: sessionId,
+    });
+
+    return {
+      session_id: sessionId,
+      created_at: new Date().toISOString(),
+      status: "running",
+      message_count: 0,
+    };
   }
 
   /**
-   * Get or create a session for a given sessionId.
-   *
-   * - If a Machine is already running for this session, returns its info.
-   * - Otherwise, creates a new Fly Machine and stores the mapping in Redis.
+   * Send a message to a session.
+   * Writes the message to the sandbox inbox and starts a background process
+   * to handle the turn. Returns immediately (async processing).
    */
-  async getOrCreateSession(
+  async sendMessage(
     sessionId: string,
-    prompt: string
-  ): Promise<SessionInfo> {
-    // Check for an existing machine mapping
-    const existing = await this.redis.get(`agent:machine:${sessionId}`);
-    if (existing !== null) {
-      const info: SessionInfo = JSON.parse(existing);
-      console.log(
-        `[orchestrator] session=${sessionId} already has machine=${info.machine_id}`
-      );
-      return info;
-    }
+    messageId: string,
+    content: string,
+  ): Promise<void> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
 
-    // Create a new Machine for this session
-    const machine = await this.createMachine(sessionId, prompt);
-    const info: SessionInfo = {
-      session_id: sessionId,
-      machine_id: machine.id,
+    // Write message to inbox
+    const message: InboxMessage = {
+      message_id: messageId,
+      content,
       created_at: new Date().toISOString(),
     };
-
-    // Store session → machine mapping; expire after max timeout + buffer
-    await this.redis.set(
-      `agent:machine:${sessionId}`,
-      JSON.stringify(info),
-      "EX",
-      config.maxTurnTimeout + 300
+    await sandbox.writeFile(
+      `${config.paths.inbox}/${messageId}.json`,
+      JSON.stringify(message),
     );
 
-    console.log(
-      `[orchestrator] session=${sessionId} created machine=${machine.id}`
-    );
-    return info;
-  }
-
-  /**
-   * Create a new Fly Machine configured for a single-use agent run.
-   * The machine will auto-stop after inactivity and auto-destroy on stop.
-   */
-  private async createMachine(
-    sessionId: string,
-    prompt: string
-  ): Promise<FlyMachine> {
-    const body: CreateMachineRequest = {
-      name: `agent-session-${sessionId}`,
-      config: {
-        image: config.flyAgentImage,
-        auto_destroy: true,
-        stop_config: {
-          timeout: config.stopConfigTimeout,
-          signal: "SIGTERM",
-        },
-        restart: {
-          policy: "no",
-        },
-        guest: {
-          cpu_kind: config.machine.cpuKind,
-          cpus: config.machine.cpus,
-          memory_mb: config.machine.memoryMb,
-        },
-        env: {
-          SESSION_ID: sessionId,
-          AGENT_PROMPT: prompt,
-          REDIS_URL: config.redisUrl,
-          ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "",
-          STARTED_AT: String(Date.now() / 1000),
-        },
-      },
-    };
-
-    const resp = await fetch(
-      `${FLY_API_BASE}/apps/${config.flyAppName}/machines`,
+    // Start agent process to handle this turn
+    await sandbox.startProcess(
+      `node /app/dist/agent/handle-turn.js ${messageId}`,
       {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${config.flyApiToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      }
+        processId: `turn-${messageId}`,
+        timeout: config.maxTurnTimeout * 1000,
+      },
+    );
+  }
+
+  /** Check if a message has been processed (poll outbox) */
+  async getMessageStatus(
+    sessionId: string,
+    messageId: string,
+  ): Promise<OutboxMessage | null> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
+
+    try {
+      const file = await sandbox.readFile(
+        `${config.paths.outbox}/${messageId}.json`,
+      );
+      return JSON.parse(
+        typeof file === "string" ? file : file.content,
+      ) as OutboxMessage;
+    } catch {
+      // File doesn't exist yet — still processing
+      return null;
+    }
+  }
+
+  /** Get full conversation history */
+  async getHistory(sessionId: string): Promise<ConversationTurn[]> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
+
+    try {
+      const file = await sandbox.readFile(config.paths.history);
+      return JSON.parse(
+        typeof file === "string" ? file : file.content,
+      ) as ConversationTurn[];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Get session status info */
+  async getSessionStatus(sessionId: string): Promise<SessionInfo> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
+    const history = await this.getHistory(sessionId);
+    const processes = await sandbox.listProcesses();
+    const isProcessing = processes.some((p: { id?: string }) =>
+      p.id?.startsWith("turn-"),
     );
 
-    if (!resp.ok) {
-      throw new Error(
-        `Failed to create machine for session=${sessionId}: ${resp.status} ${await resp.text()}`
-      );
-    }
-
-    const machine = (await resp.json()) as FlyMachine;
-    return machine;
+    return {
+      session_id: sessionId,
+      created_at: "",
+      status: isProcessing ? "running" : "done",
+      message_count: history.filter((t) => t.role === "user").length,
+    };
   }
 
-  /**
-   * Get current status of a session (non-blocking).
-   * Returns the status string, or null if still running.
-   */
-  async getSessionStatus(sessionId: string): Promise<string | null> {
-    return this.redis.get(`agent:status:${sessionId}`);
-  }
-
-  /**
-   * Wait for a session to finish (status = done or error).
-   * Polls Redis until resolved or the timeout is reached.
-   */
-  async waitForSession(
-    sessionId: string,
-    timeoutMs = config.maxTurnTimeout * 1000
-  ): Promise<string> {
-    const deadline = Date.now() + timeoutMs;
-    const pollInterval = 2000; // 2s
-
-    while (Date.now() < deadline) {
-      const status = await this.redis.get(`agent:status:${sessionId}`);
-      if (status !== null) {
-        return status;
-      }
-      await sleep(pollInterval);
-    }
-
-    throw new Error(`session=${sessionId} timed out after ${timeoutMs}ms`);
+  /** Destroy a session and free all resources */
+  async destroySession(sessionId: string): Promise<void> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
+    await sandbox.destroy();
   }
 }
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ─── Main ───────────────────────────────────────────────────────────────────
-
-async function main(): Promise<void> {
-  const orchestrator = new Orchestrator();
-  orchestrator.start();
-
-  // Graceful shutdown on SIGTERM / SIGINT
-  const shutdown = async () => {
-    console.log("[orchestrator] shutting down…");
-    await orchestrator.close();
-    process.exit(0);
-  };
-
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-
-  // Example: dispatch a single agent session
-  const sessionId = process.env.SESSION_ID ?? `test-${Date.now()}`;
-  const prompt = process.env.AGENT_PROMPT ?? "Hello, Claude!";
-
-  const session = await orchestrator.getOrCreateSession(sessionId, prompt);
-  console.log("[orchestrator] dispatched:", session);
-
-  const status = await orchestrator.waitForSession(sessionId);
-  console.log(`[orchestrator] session=${sessionId} finished with status:`, status);
-
-  await orchestrator.close();
-}
-
-main().catch((err) => {
-  console.error("[orchestrator] fatal:", err);
-  process.exit(1);
-});
