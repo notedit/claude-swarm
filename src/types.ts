@@ -8,25 +8,8 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
 }
 
-// Stored in /app/inbox/{msgId}.json by the Worker
-export interface InboxMessage {
-  message_id: string;
-  content: string;
-  created_at: string;
-}
-
-// Stored in /app/outbox/{msgId}.json by the Agent
-export interface OutboxMessage {
-  message_id: string;
-  status: "done" | "error";
-  content?: string;
-  error?: string;
-  created_at: string;
-}
-
-// A single conversation turn (stored in history.json)
+// A single conversation turn (maintained in agent memory)
 export interface ConversationTurn {
-  message_id: string;
   role: "user" | "assistant";
   content: string;
   timestamp: string;

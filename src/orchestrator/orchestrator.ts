@@ -1,16 +1,10 @@
 // Orchestrator — manages agent sessions via Cloudflare Sandbox SDK.
-// Creates sandboxes, dispatches messages, and tracks conversation state
-// using file-based IPC (inbox/outbox pattern).
+// Creates sandboxes, starts the agent HTTP server, and forwards
+// messages via sandbox.fetch() for multi-turn conversations.
 
 import { getSandbox } from "@cloudflare/sandbox";
 import { config } from "../config";
-import type {
-  Env,
-  SessionInfo,
-  InboxMessage,
-  OutboxMessage,
-  ConversationTurn,
-} from "../types";
+import type { Env, SessionInfo, ConversationTurn } from "../types";
 
 export class Orchestrator {
   private env: Env;
@@ -19,7 +13,7 @@ export class Orchestrator {
     this.env = env;
   }
 
-  /** Initialize a new session sandbox */
+  /** Initialize a new session: create sandbox and start agent HTTP server */
   async createSession(sessionId: string): Promise<SessionInfo> {
     const sandbox = getSandbox(this.env.Sandbox, sessionId, {
       sleepAfter: config.sandboxSleepAfter,
@@ -28,17 +22,15 @@ export class Orchestrator {
     // Keep sandbox alive during active session
     await sandbox.setKeepAlive(true);
 
-    // Create inbox/outbox directories
-    await sandbox.mkdir(config.paths.inbox, { recursive: true });
-    await sandbox.mkdir(config.paths.outbox, { recursive: true });
-
-    // Initialize empty conversation history
-    await sandbox.writeFile(config.paths.history, JSON.stringify([]));
-
     // Set agent environment variables
     await sandbox.setEnvVars({
       ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY ?? "",
       SESSION_ID: sessionId,
+    });
+
+    // Start the agent HTTP server inside the sandbox
+    await sandbox.startProcess("node /app/dist/agent/server.js", {
+      processId: `agent-${sessionId}`,
     });
 
     return {
@@ -50,87 +42,74 @@ export class Orchestrator {
   }
 
   /**
-   * Send a message to a session.
-   * Writes the message to the sandbox inbox and starts a background process
-   * to handle the turn. Returns immediately (async processing).
+   * Send a message to a session's agent via sandbox.fetch().
+   * Blocks until the agent returns a response (synchronous multi-turn).
    */
   async sendMessage(
     sessionId: string,
-    messageId: string,
     content: string,
-  ): Promise<void> {
+  ): Promise<{ role: string; content: string }> {
     const sandbox = getSandbox(this.env.Sandbox, sessionId);
 
-    // Write message to inbox
-    const message: InboxMessage = {
-      message_id: messageId,
-      content,
-      created_at: new Date().toISOString(),
-    };
-    await sandbox.writeFile(
-      `${config.paths.inbox}/${messageId}.json`,
-      JSON.stringify(message),
+    const response = await sandbox.fetch(
+      new Request("http://localhost/message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      }),
     );
 
-    // Start agent process to handle this turn
-    await sandbox.startProcess(
-      `node /app/dist/agent/handle-turn.js ${messageId}`,
-      {
-        processId: `turn-${messageId}`,
-        timeout: config.maxTurnTimeout * 1000,
-      },
-    );
-  }
-
-  /** Check if a message has been processed (poll outbox) */
-  async getMessageStatus(
-    sessionId: string,
-    messageId: string,
-  ): Promise<OutboxMessage | null> {
-    const sandbox = getSandbox(this.env.Sandbox, sessionId);
-
-    try {
-      const file = await sandbox.readFile(
-        `${config.paths.outbox}/${messageId}.json`,
-      );
-      return JSON.parse(
-        typeof file === "string" ? file : file.content,
-      ) as OutboxMessage;
-    } catch {
-      // File doesn't exist yet — still processing
-      return null;
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Agent error (${response.status}): ${err}`);
     }
+
+    return (await response.json()) as { role: string; content: string };
   }
 
-  /** Get full conversation history */
+  /** Get full conversation history from the agent */
   async getHistory(sessionId: string): Promise<ConversationTurn[]> {
     const sandbox = getSandbox(this.env.Sandbox, sessionId);
 
-    try {
-      const file = await sandbox.readFile(config.paths.history);
-      return JSON.parse(
-        typeof file === "string" ? file : file.content,
-      ) as ConversationTurn[];
-    } catch {
+    const response = await sandbox.fetch(
+      new Request("http://localhost/messages", { method: "GET" }),
+    );
+
+    if (!response.ok) {
       return [];
     }
+
+    const data = (await response.json()) as { history: ConversationTurn[] };
+    return data.history;
   }
 
   /** Get session status info */
   async getSessionStatus(sessionId: string): Promise<SessionInfo> {
     const sandbox = getSandbox(this.env.Sandbox, sessionId);
-    const history = await this.getHistory(sessionId);
-    const processes = await sandbox.listProcesses();
-    const isProcessing = processes.some((p: { id?: string }) =>
-      p.id?.startsWith("turn-"),
-    );
 
-    return {
-      session_id: sessionId,
-      created_at: "",
-      status: isProcessing ? "running" : "done",
-      message_count: history.filter((t) => t.role === "user").length,
-    };
+    try {
+      const response = await sandbox.fetch(
+        new Request("http://localhost/health", { method: "GET" }),
+      );
+      const data = (await response.json()) as {
+        status: string;
+        turns: number;
+      };
+
+      return {
+        session_id: sessionId,
+        created_at: "",
+        status: data.status === "ok" ? "running" : "error",
+        message_count: Math.floor(data.turns / 2), // turns include both user + assistant
+      };
+    } catch {
+      return {
+        session_id: sessionId,
+        created_at: "",
+        status: "error",
+        message_count: 0,
+      };
+    }
   }
 
   /** Destroy a session and free all resources */

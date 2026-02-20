@@ -10,16 +10,15 @@ A Cloudflare Sandbox-based Agent lifecycle management framework with multi-turn 
 
 ### English
 
-Claude Swarm runs Claude AI agents inside [Cloudflare Sandboxes](https://developers.cloudflare.com/sandbox/) — isolated container environments managed by Durable Objects. A Cloudflare Worker acts as the orchestrator, creating sandboxes on demand and routing messages to agents via file-based IPC.
+Claude Swarm runs Claude AI agents inside [Cloudflare Sandboxes](https://developers.cloudflare.com/sandbox/) — isolated container environments managed by Durable Objects. A Cloudflare Worker acts as the orchestrator, creating sandboxes on demand and forwarding messages to the agent's HTTP server via `sandbox.fetch()`.
 
 #### Architecture
 
 ```
 Client (curl / app)
     │
-    ├── POST /sessions                  Create session (init sandbox)
-    ├── POST /sessions/:id/messages     Send message → async processing
-    ├── GET  /sessions/:id/messages/:m  Poll for response
+    ├── POST /sessions                  Create session (start agent server)
+    ├── POST /sessions/:id/messages     Send message → sandbox.fetch()
     ├── GET  /sessions/:id/messages     Get conversation history
     ├── GET  /sessions/:id              Session status
     └── DELETE /sessions/:id            Destroy sandbox
@@ -28,26 +27,27 @@ Client (curl / app)
 Cloudflare Worker (src/index.ts)
     │
     ├── getSandbox(env.Sandbox, sessionId)
-    ├── sandbox.writeFile("/app/inbox/{msgId}.json")
-    ├── sandbox.startProcess("node handle-turn.js {msgId}")
-    ├── sandbox.readFile("/app/outbox/{msgId}.json")
+    ├── sandbox.startProcess("node /app/dist/agent/server.js")
+    ├── sandbox.fetch(POST /message)  → agent processes + responds
+    ├── sandbox.fetch(GET /messages)  → conversation history
     └── sandbox.destroy()
     │
     ▼
 Sandbox Container (Dockerfile)
     ├── Node.js 20 + Claude Agent SDK
-    ├── /app/inbox/    ← Worker writes messages
-    ├── /app/outbox/   ← Agent writes responses
-    └── /app/history.json  ← Conversation state
+    └── Agent HTTP server (src/agent/server.ts)
+        ├── POST /message   → process with Claude SDK
+        ├── GET  /messages  → return conversation history
+        └── Conversation state in memory
 ```
 
 #### Multi-turn Flow
 
-1. **Create session** — Worker initializes a sandbox with inbox/outbox directories
-2. **Send message** — Worker writes to inbox, starts `handle-turn.js` process
-3. **Agent processes** — Loads conversation history, calls Claude SDK with context, writes response to outbox
-4. **Poll result** — Client polls outbox until response is ready
-5. **Next turn** — Agent automatically has context from all previous turns
+1. **Create session** — Worker creates sandbox, starts the agent HTTP server
+2. **Send message** — Worker forwards request via `sandbox.fetch()` to agent
+3. **Agent processes** — Builds prompt with conversation history, calls Claude SDK
+4. **Direct response** — Agent returns response synchronously (no polling needed)
+5. **Next turn** — Agent retains conversation state in memory across turns
 
 #### Lifecycle Management
 
@@ -60,15 +60,15 @@ Sandbox Container (Dockerfile)
 
 ### 中文
 
-Claude Swarm 将 Claude AI Agent 运行在 [Cloudflare Sandbox](https://developers.cloudflare.com/sandbox/) 中 — 由 Durable Objects 管理的隔离容器环境。Cloudflare Worker 作为协调器，按需创建沙箱，通过基于文件的 IPC 路由消息到 Agent。
+Claude Swarm 将 Claude AI Agent 运行在 [Cloudflare Sandbox](https://developers.cloudflare.com/sandbox/) 中 — 由 Durable Objects 管理的隔离容器环境。Cloudflare Worker 作为协调器，按需创建沙箱，通过 `sandbox.fetch()` 将消息转发到 Agent 的 HTTP 服务器。
 
 #### 多轮对话流程
 
-1. **创建会话** — Worker 初始化沙箱，创建 inbox/outbox 目录
-2. **发送消息** — Worker 写入 inbox，启动 `handle-turn.js` 进程
-3. **Agent 处理** — 加载对话历史，带上下文调用 Claude SDK，将响应写入 outbox
-4. **轮询结果** — 客户端轮询 outbox 直到响应就绪
-5. **下一轮** — Agent 自动拥有所有之前轮次的上下文
+1. **创建会话** — Worker 创建沙箱，启动 Agent HTTP 服务器
+2. **发送消息** — Worker 通过 `sandbox.fetch()` 转发请求到 Agent
+3. **Agent 处理** — 构建含对话历史的提示词，调用 Claude SDK
+4. **直接响应** — Agent 同步返回响应（无需轮询）
+5. **下一轮** — Agent 在内存中保持对话状态，跨轮次保留上下文
 
 #### 生命周期管理
 
@@ -87,8 +87,8 @@ src/
   types.ts                  # Shared type definitions / 共享类型
   config.ts                 # Tunable parameters / 可调参数
   agent/
-    handle-turn.ts          # Per-message handler (multi-turn) / 单消息处理器
-    runner.ts               # One-shot runner (backward compat) / 单次运行器
+    server.ts               # Agent HTTP server (multi-turn) / Agent HTTP 服务器
+    runner.ts               # One-shot runner (standalone mode) / 单次运行器
   orchestrator/
     orchestrator.ts         # Session + sandbox management / 会话管理
 wrangler.toml               # Cloudflare Worker config / Worker 配置
@@ -134,6 +134,7 @@ wrangler secret put ANTHROPIC_API_KEY
 curl -X POST http://localhost:8787/sessions \
   -H 'Content-Type: application/json' \
   -d '{"session_id": "my-session"}'
+# → 201 { "session_id": "my-session", "status": "running", ... }
 ```
 
 ### Send Message / 发送消息
@@ -142,16 +143,10 @@ curl -X POST http://localhost:8787/sessions \
 curl -X POST http://localhost:8787/sessions/my-session/messages \
   -H 'Content-Type: application/json' \
   -d '{"content": "List all TypeScript files"}'
-# → 202 { "message_id": "msg-...", "status": "processing" }
+# → 200 { "session_id": "my-session", "role": "assistant", "content": "..." }
 ```
 
-### Poll for Response / 轮询响应
-
-```bash
-curl http://localhost:8787/sessions/my-session/messages/msg-123
-# → 202 { "status": "processing" }  (still working)
-# → 200 { "status": "done", "content": "..." }  (complete)
-```
+Responses are synchronous — the request blocks until the agent finishes processing.
 
 ### Get Conversation History / 获取对话历史
 
@@ -164,7 +159,7 @@ curl http://localhost:8787/sessions/my-session/messages
 
 ```bash
 curl http://localhost:8787/sessions/my-session
-# → { "session_id": "my-session", "status": "done", "message_count": 3 }
+# → { "session_id": "my-session", "status": "running", "message_count": 3 }
 ```
 
 ### Destroy Session / 销毁会话

@@ -1,7 +1,9 @@
 // Cloudflare Worker entry point for claude-swarm.
 // Exports the Sandbox Durable Object class and the fetch handler.
+// Routes requests to the Orchestrator, which forwards to sandbox agents
+// via sandbox.fetch() for synchronous multi-turn conversations.
 
-import { Sandbox } from "@cloudflare/sandbox";
+import { Sandbox, proxyToSandbox } from "@cloudflare/sandbox";
 import { Orchestrator } from "./orchestrator/orchestrator";
 import type { Env } from "./types";
 
@@ -10,6 +12,10 @@ export { Sandbox };
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // Required for sandbox preview URLs
+    const proxyResponse = await proxyToSandbox(request, env);
+    if (proxyResponse) return proxyResponse;
+
     const url = new URL(request.url);
     const orchestrator = new Orchestrator(env);
 
@@ -27,7 +33,7 @@ export default {
         return json(201, session);
       }
 
-      // POST /sessions/:id/messages — send a message (async)
+      // POST /sessions/:id/messages — send a message (synchronous via sandbox.fetch)
       const sendMatch = url.pathname.match(/^\/sessions\/([^/]+)\/messages$/);
       if (request.method === "POST" && sendMatch) {
         const sessionId = sendMatch[1];
@@ -36,28 +42,11 @@ export default {
           return json(400, { error: "content is required" });
         }
 
-        const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        await orchestrator.sendMessage(sessionId, messageId, body.content);
-        return json(202, {
-          message_id: messageId,
-          status: "processing",
+        const result = await orchestrator.sendMessage(sessionId, body.content);
+        return json(200, {
+          session_id: sessionId,
+          ...result,
         });
-      }
-
-      // GET /sessions/:id/messages/:msgId — poll for a specific message result
-      const pollMatch = url.pathname.match(
-        /^\/sessions\/([^/]+)\/messages\/([^/]+)$/,
-      );
-      if (request.method === "GET" && pollMatch) {
-        const [, sessionId, messageId] = pollMatch;
-        const result = await orchestrator.getMessageStatus(
-          sessionId,
-          messageId,
-        );
-        if (result) {
-          return json(200, result);
-        }
-        return json(202, { message_id: messageId, status: "processing" });
       }
 
       // GET /sessions/:id/messages — get full conversation history
@@ -79,9 +68,8 @@ export default {
       }
 
       // DELETE /sessions/:id — destroy session
-      const deleteMatch = url.pathname.match(/^\/sessions\/([^/]+)$/);
-      if (request.method === "DELETE" && deleteMatch) {
-        const sessionId = deleteMatch[1];
+      if (request.method === "DELETE" && sessionMatch) {
+        const sessionId = sessionMatch![1];
         await orchestrator.destroySession(sessionId);
         return json(200, { session_id: sessionId, destroyed: true });
       }

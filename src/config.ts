@@ -7,13 +7,6 @@ export const config = {
 
   // Sandbox settings
   sandboxSleepAfter: "10m",  // auto-sleep after inactivity
-
-  // File paths inside the sandbox container
-  paths: {
-    inbox: "/app/inbox",
-    outbox: "/app/outbox",
-    history: "/app/history.json",
-  },
 } as const;
 
 export type Config = typeof config;
