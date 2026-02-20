@@ -1,203 +1,120 @@
-// Orchestrator - manages Agent sessions and Fly Machine lifecycle
-// Entry point for the orchestrator process.
+// Orchestrator — manages agent sessions via Cloudflare Sandbox SDK.
+// Creates sandboxes, starts the agent HTTP server, and forwards
+// messages via sandbox.fetch() for multi-turn conversations.
 
-import Redis from "ioredis";
+import { getSandbox } from "@cloudflare/sandbox";
 import { config } from "../config";
-import { MachineReaper } from "./reaper";
-import type {
-  CreateMachineRequest,
-  FlyMachine,
-  SessionInfo,
-} from "../types";
-
-const FLY_API_BASE = "https://api.machines.dev/v1";
+import type { Env, SessionInfo, ConversationTurn } from "../types";
 
 export class Orchestrator {
-  private redis: Redis;
-  private reaper: MachineReaper;
+  private env: Env;
 
-  constructor() {
-    this.redis = new Redis(config.redisUrl);
-    this.reaper = new MachineReaper();
+  constructor(env: Env) {
+    this.env = env;
   }
 
-  /** Start the orchestrator and its background reaper */
-  start(): void {
-    this.reaper.start();
-    console.log("[orchestrator] started");
-  }
+  /** Initialize a new session: create sandbox and start agent HTTP server */
+  async createSession(sessionId: string): Promise<SessionInfo> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId, {
+      sleepAfter: config.sandboxSleepAfter,
+    });
 
-  /** Gracefully shut down */
-  async close(): Promise<void> {
-    await this.reaper.close();
-    await this.redis.quit();
-    console.log("[orchestrator] stopped");
-  }
+    // Keep sandbox alive during active session
+    await sandbox.setKeepAlive(true);
 
-  /**
-   * Get or create a session for a given sessionId.
-   *
-   * - If a Machine is already running for this session, returns its info.
-   * - Otherwise, creates a new Fly Machine and stores the mapping in Redis.
-   */
-  async getOrCreateSession(
-    sessionId: string,
-    prompt: string
-  ): Promise<SessionInfo> {
-    // Check for an existing machine mapping
-    const existing = await this.redis.get(`agent:machine:${sessionId}`);
-    if (existing !== null) {
-      const info: SessionInfo = JSON.parse(existing);
-      console.log(
-        `[orchestrator] session=${sessionId} already has machine=${info.machine_id}`
-      );
-      return info;
-    }
+    // Set agent environment variables
+    await sandbox.setEnvVars({
+      ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY ?? "",
+      SESSION_ID: sessionId,
+    });
 
-    // Create a new Machine for this session
-    const machine = await this.createMachine(sessionId, prompt);
-    const info: SessionInfo = {
+    // Start the agent HTTP server inside the sandbox
+    await sandbox.startProcess("node /app/dist/agent/server.js", {
+      processId: `agent-${sessionId}`,
+    });
+
+    return {
       session_id: sessionId,
-      machine_id: machine.id,
       created_at: new Date().toISOString(),
+      status: "running",
+      message_count: 0,
     };
-
-    // Store session → machine mapping; expire after max timeout + buffer
-    await this.redis.set(
-      `agent:machine:${sessionId}`,
-      JSON.stringify(info),
-      "EX",
-      config.maxTurnTimeout + 300
-    );
-
-    console.log(
-      `[orchestrator] session=${sessionId} created machine=${machine.id}`
-    );
-    return info;
   }
 
   /**
-   * Create a new Fly Machine configured for a single-use agent run.
-   * The machine will auto-stop after inactivity and auto-destroy on stop.
+   * Send a message to a session's agent via sandbox.fetch().
+   * Blocks until the agent returns a response (synchronous multi-turn).
    */
-  private async createMachine(
+  async sendMessage(
     sessionId: string,
-    prompt: string
-  ): Promise<FlyMachine> {
-    const body: CreateMachineRequest = {
-      name: `agent-session-${sessionId}`,
-      config: {
-        image: config.flyAgentImage,
-        auto_destroy: true,
-        stop_config: {
-          timeout: config.stopConfigTimeout,
-          signal: "SIGTERM",
-        },
-        restart: {
-          policy: "no",
-        },
-        guest: {
-          cpu_kind: config.machine.cpuKind,
-          cpus: config.machine.cpus,
-          memory_mb: config.machine.memoryMb,
-        },
-        env: {
-          SESSION_ID: sessionId,
-          AGENT_PROMPT: prompt,
-          REDIS_URL: config.redisUrl,
-          ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "",
-          STARTED_AT: String(Date.now() / 1000),
-        },
-      },
-    };
+    content: string,
+  ): Promise<{ role: string; content: string }> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
 
-    const resp = await fetch(
-      `${FLY_API_BASE}/apps/${config.flyAppName}/machines`,
-      {
+    const response = await sandbox.fetch(
+      new Request("http://localhost/message", {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${config.flyApiToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      }
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      }),
     );
 
-    if (!resp.ok) {
-      throw new Error(
-        `Failed to create machine for session=${sessionId}: ${resp.status} ${await resp.text()}`
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Agent error (${response.status}): ${err}`);
+    }
+
+    return (await response.json()) as { role: string; content: string };
+  }
+
+  /** Get full conversation history from the agent */
+  async getHistory(sessionId: string): Promise<ConversationTurn[]> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
+
+    const response = await sandbox.fetch(
+      new Request("http://localhost/messages", { method: "GET" }),
+    );
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const data = (await response.json()) as { history: ConversationTurn[] };
+    return data.history;
+  }
+
+  /** Get session status info */
+  async getSessionStatus(sessionId: string): Promise<SessionInfo> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
+
+    try {
+      const response = await sandbox.fetch(
+        new Request("http://localhost/health", { method: "GET" }),
       );
+      const data = (await response.json()) as {
+        status: string;
+        turns: number;
+      };
+
+      return {
+        session_id: sessionId,
+        created_at: "",
+        status: data.status === "ok" ? "running" : "error",
+        message_count: Math.floor(data.turns / 2), // turns include both user + assistant
+      };
+    } catch {
+      return {
+        session_id: sessionId,
+        created_at: "",
+        status: "error",
+        message_count: 0,
+      };
     }
-
-    const machine = (await resp.json()) as FlyMachine;
-    return machine;
   }
 
-  /**
-   * Get current status of a session (non-blocking).
-   * Returns the status string, or null if still running.
-   */
-  async getSessionStatus(sessionId: string): Promise<string | null> {
-    return this.redis.get(`agent:status:${sessionId}`);
-  }
-
-  /**
-   * Wait for a session to finish (status = done or error).
-   * Polls Redis until resolved or the timeout is reached.
-   */
-  async waitForSession(
-    sessionId: string,
-    timeoutMs = config.maxTurnTimeout * 1000
-  ): Promise<string> {
-    const deadline = Date.now() + timeoutMs;
-    const pollInterval = 2000; // 2s
-
-    while (Date.now() < deadline) {
-      const status = await this.redis.get(`agent:status:${sessionId}`);
-      if (status !== null) {
-        return status;
-      }
-      await sleep(pollInterval);
-    }
-
-    throw new Error(`session=${sessionId} timed out after ${timeoutMs}ms`);
+  /** Destroy a session and free all resources */
+  async destroySession(sessionId: string): Promise<void> {
+    const sandbox = getSandbox(this.env.Sandbox, sessionId);
+    await sandbox.destroy();
   }
 }
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ─── Main ───────────────────────────────────────────────────────────────────
-
-async function main(): Promise<void> {
-  const orchestrator = new Orchestrator();
-  orchestrator.start();
-
-  // Graceful shutdown on SIGTERM / SIGINT
-  const shutdown = async () => {
-    console.log("[orchestrator] shutting down…");
-    await orchestrator.close();
-    process.exit(0);
-  };
-
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-
-  // Example: dispatch a single agent session
-  const sessionId = process.env.SESSION_ID ?? `test-${Date.now()}`;
-  const prompt = process.env.AGENT_PROMPT ?? "Hello, Claude!";
-
-  const session = await orchestrator.getOrCreateSession(sessionId, prompt);
-  console.log("[orchestrator] dispatched:", session);
-
-  const status = await orchestrator.waitForSession(sessionId);
-  console.log(`[orchestrator] session=${sessionId} finished with status:`, status);
-
-  await orchestrator.close();
-}
-
-main().catch((err) => {
-  console.error("[orchestrator] fatal:", err);
-  process.exit(1);
-});

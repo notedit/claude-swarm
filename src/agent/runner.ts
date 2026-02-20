@@ -1,52 +1,27 @@
-// Agent runner - entry point executed inside each Fly Machine
-// Uses the Claude Agent SDK to run an agentic task with built-in tools.
+// Agent runner — simplified one-shot entry point for the Cloudflare Sandbox.
+// For multi-turn conversations, use handle-turn.ts instead.
+//
+// Reads SESSION_ID and AGENT_PROMPT from environment variables,
+// runs a single Claude Agent SDK session, and writes the result to a file.
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { HeartbeatReporter } from "./heartbeat";
+import { writeFileSync } from "fs";
 import { config } from "../config";
 
 const SESSION_ID = process.env.SESSION_ID;
 const PROMPT = process.env.AGENT_PROMPT;
 
-if (!SESSION_ID) {
-  console.error("[runner] SESSION_ID env var is required");
-  process.exit(1);
-}
-
-if (!PROMPT) {
-  console.error("[runner] AGENT_PROMPT env var is required");
+if (!SESSION_ID || !PROMPT) {
+  console.error("[runner] SESSION_ID and AGENT_PROMPT env vars required");
   process.exit(1);
 }
 
 async function main(): Promise<void> {
-  const heartbeat = new HeartbeatReporter(SESSION_ID!);
-  heartbeat.start();
   console.log(`[runner] session=${SESSION_ID} started`);
-
-  try {
-    const result = await runAgent(PROMPT!);
-    console.log(`[runner] session=${SESSION_ID} result: ${result.slice(0, 200)}`);
-    await heartbeat.markDone();
-    console.log(`[runner] session=${SESSION_ID} done`);
-  } catch (err) {
-    console.error("[runner] agent error:", err);
-    await heartbeat.markError(err);
-    process.exit(1);
-  } finally {
-    await heartbeat.close();
-  }
-}
-
-/**
- * Run a Claude Agent SDK session with built-in tools.
- * The SDK handles the agentic loop (multi-turn) automatically.
- */
-async function runAgent(prompt: string): Promise<string> {
-  console.log(`[agent] running prompt: ${prompt}`);
 
   let result = "";
   for await (const message of query({
-    prompt,
+    prompt: PROMPT!,
     options: {
       allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
       permissionMode: "bypassPermissions",
@@ -58,10 +33,13 @@ async function runAgent(prompt: string): Promise<string> {
     }
   }
 
-  return result;
+  console.log(`[runner] session=${SESSION_ID} done`);
+  writeFileSync("/app/result.json", JSON.stringify({ status: "done", result }));
 }
 
 main().catch((err) => {
+  const msg = err instanceof Error ? err.message : String(err);
   console.error("[runner] fatal:", err);
+  writeFileSync("/app/result.json", JSON.stringify({ status: "error", error: msg }));
   process.exit(1);
 });
