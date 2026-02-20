@@ -1,0 +1,29 @@
+# Multi-stage build for the Agent image
+# This image runs inside each Fly Machine as a short-lived agent process.
+
+# ── Build stage ──────────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm install
+
+COPY tsconfig.json ./
+COPY src/ ./src/
+
+RUN npm run build
+
+# ── Production stage ─────────────────────────────────────────────────────────
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
+
+COPY --from=builder /app/dist ./dist
+
+# The agent runner reads SESSION_ID, AGENT_PROMPT, REDIS_URL, ANTHROPIC_API_KEY
+# from environment variables injected by the Orchestrator when creating the Machine.
+CMD ["node", "dist/agent/runner.js"]

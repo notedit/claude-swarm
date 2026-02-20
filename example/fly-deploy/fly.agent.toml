@@ -1,0 +1,16 @@
+# Fly.io configuration for the Agent image
+#
+# This app is used as an image registry for agent machines.
+# Machines are NOT deployed by `flyctl deploy` — they are created dynamically
+# by the Orchestrator via the Fly Machines API. This config is used only to
+# build and push the agent Docker image to the Fly registry.
+#
+# Usage:
+#   cd <project-root>
+#   flyctl deploy -c example/fly-deploy/fly.agent.toml --image-only
+
+app = "claude-agent-app"
+primary_region = "iad"
+
+[build]
+  dockerfile = "example/fly-deploy/Dockerfile.agent"

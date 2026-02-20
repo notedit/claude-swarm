@@ -1,0 +1,31 @@
+# Fly.io configuration for the Orchestrator
+#
+# The Orchestrator runs as a persistent HTTP server that accepts session
+# requests and spawns ephemeral agent machines via the Fly Machines API.
+#
+# Usage:
+#   cd <project-root>
+#   flyctl deploy -c example/fly-deploy/fly.orchestrator.toml
+
+app = "claude-orchestrator"
+primary_region = "iad"
+
+[build]
+  dockerfile = "example/fly-deploy/Dockerfile.orchestrator"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[env]
+  PORT = "8080"
+  FLY_APP_NAME = "claude-agent-app"
+  FLY_AGENT_IMAGE = "registry.fly.io/claude-agent-app:latest"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
