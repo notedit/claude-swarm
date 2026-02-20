@@ -105,6 +105,7 @@ export class Orchestrator {
           SESSION_ID: sessionId,
           AGENT_PROMPT: prompt,
           REDIS_URL: config.redisUrl,
+          ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "",
           STARTED_AT: String(Date.now() / 1000),
         },
       },
@@ -130,6 +131,14 @@ export class Orchestrator {
 
     const machine = (await resp.json()) as FlyMachine;
     return machine;
+  }
+
+  /**
+   * Get current status of a session (non-blocking).
+   * Returns the status string, or null if still running.
+   */
+  async getSessionStatus(sessionId: string): Promise<string | null> {
+    return this.redis.get(`agent:status:${sessionId}`);
   }
 
   /**

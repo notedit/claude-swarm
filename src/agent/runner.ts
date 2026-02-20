@@ -1,7 +1,9 @@
 // Agent runner - entry point executed inside each Fly Machine
-// Wires together the heartbeat reporter and the Claude SDK client
+// Uses the Claude Agent SDK to run an agentic task with built-in tools.
 
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { HeartbeatReporter } from "./heartbeat";
+import { config } from "../config";
 
 const SESSION_ID = process.env.SESSION_ID;
 const PROMPT = process.env.AGENT_PROMPT;
@@ -22,7 +24,8 @@ async function main(): Promise<void> {
   console.log(`[runner] session=${SESSION_ID} started`);
 
   try {
-    await runAgent(PROMPT!);
+    const result = await runAgent(PROMPT!);
+    console.log(`[runner] session=${SESSION_ID} result: ${result.slice(0, 200)}`);
     await heartbeat.markDone();
     console.log(`[runner] session=${SESSION_ID} done`);
   } catch (err) {
@@ -35,21 +38,27 @@ async function main(): Promise<void> {
 }
 
 /**
- * Placeholder for the actual Claude SDK invocation.
- * Replace this with your ClaudeSDKClient calls.
+ * Run a Claude Agent SDK session with built-in tools.
+ * The SDK handles the agentic loop (multi-turn) automatically.
  */
-async function runAgent(prompt: string): Promise<void> {
-  // TODO: wire in the Claude SDK client here, e.g.:
-  //
-  //   import { ClaudeClient } from "@anthropic-ai/sdk";
-  //   const client = new ClaudeClient({ apiKey: process.env.ANTHROPIC_API_KEY });
-  //   const stream = client.messages.stream({ model: "claude-opus-4-6", ... });
-  //   for await (const chunk of stream) { ... }
-
+async function runAgent(prompt: string): Promise<string> {
   console.log(`[agent] running prompt: ${prompt}`);
 
-  // Simulate work so the heartbeat fires at least once during tests
-  await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  let result = "";
+  for await (const message of query({
+    prompt,
+    options: {
+      allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+      permissionMode: "bypassPermissions",
+      maxTurns: config.maxTurns,
+    },
+  })) {
+    if ("result" in message) {
+      result = message.result as string;
+    }
+  }
+
+  return result;
 }
 
 main().catch((err) => {
