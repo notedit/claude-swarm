@@ -25,3 +25,15 @@ export interface SessionInfo {
   status: AgentStatus;
   message_count: number;
 }
+
+// Trace context propagated from Worker → Orchestrator → Agent
+export interface TraceContext {
+  traceId: string;
+  sessionId?: string;
+}
+
+// Envelope included in every API response for client-side tracing
+export interface ResponseMeta {
+  traceId: string;
+  durationMs: number;
+}
