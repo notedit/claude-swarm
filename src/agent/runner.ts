@@ -6,7 +6,7 @@
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { writeFileSync } from "fs";
-import { config } from "../config";
+import { config } from "../config.js";
 
 const SESSION_ID = process.env.SESSION_ID;
 const PROMPT = process.env.AGENT_PROMPT;

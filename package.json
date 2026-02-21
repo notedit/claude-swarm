@@ -2,6 +2,7 @@
   "name": "claude-swarm",
   "version": "0.2.0",
   "description": "Claude Swarm - Cloudflare Sandbox Agent lifecycle management with multi-turn support",
+  "type": "module",
   "main": "src/index.ts",
   "scripts": {
     "build": "tsc",
@@ -16,7 +17,9 @@
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",
-    "@cloudflare/sandbox": "^0.7.0"
+    "@cloudflare/sandbox": "^0.7.0",
+    "@hono/node-server": "^1.19.9",
+    "hono": "^4.12.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.0.0",

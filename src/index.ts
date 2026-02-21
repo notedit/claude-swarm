@@ -1,11 +1,11 @@
 // Cloudflare Worker entry point for claude-swarm.
 // Exports the Sandbox Durable Object class and the fetch handler.
-// Routes requests to the Orchestrator, which forwards to sandbox agents
-// via sandbox.fetch() for synchronous multi-turn conversations.
+// Routes requests to the Orchestrator, which manages sandbox agents
+// via sandbox.exec(curl) for async multi-turn conversations.
 
-import { Sandbox, proxyToSandbox } from "@cloudflare/sandbox";
-import { Orchestrator } from "./orchestrator/orchestrator";
-import type { Env } from "./types";
+import { Sandbox, proxyToSandbox, getSandbox } from "@cloudflare/sandbox";
+import { Orchestrator } from "./orchestrator/orchestrator.js";
+import type { Env } from "./types.js";
 
 // Re-export Sandbox so wrangler registers the Durable Object binding
 export { Sandbox };
@@ -33,7 +33,7 @@ export default {
         return json(201, session);
       }
 
-      // POST /sessions/:id/messages — send a message (synchronous via sandbox.fetch)
+      // POST /sessions/:id/messages — send a message (async, returns immediately)
       const sendMatch = url.pathname.match(/^\/sessions\/([^/]+)\/messages$/);
       if (request.method === "POST" && sendMatch) {
         const sessionId = sendMatch[1];
@@ -43,7 +43,7 @@ export default {
         }
 
         const result = await orchestrator.sendMessage(sessionId, body.content);
-        return json(200, {
+        return json(202, {
           session_id: sessionId,
           ...result,
         });
@@ -59,12 +59,49 @@ export default {
         return json(200, { session_id: sessionId, history });
       }
 
+      // GET /sessions/:id/status — poll for processing status
+      const statusMatch = url.pathname.match(
+        /^\/sessions\/([^/]+)\/status$/,
+      );
+      if (request.method === "GET" && statusMatch) {
+        const sessionId = statusMatch[1];
+        const status = await orchestrator.getStatus(sessionId);
+        return json(200, { session_id: sessionId, ...status });
+      }
+
       // GET /sessions/:id — session info
       const sessionMatch = url.pathname.match(/^\/sessions\/([^/]+)$/);
       if (request.method === "GET" && sessionMatch) {
         const sessionId = sessionMatch[1];
         const info = await orchestrator.getSessionStatus(sessionId);
         return json(200, info);
+      }
+
+      // GET /sessions/:id/debug — debug sandbox state
+      const debugMatch = url.pathname.match(/^\/sessions\/([^/]+)\/debug$/);
+      if (request.method === "GET" && debugMatch) {
+        const sessionId = debugMatch[1];
+        const sandbox = getSandbox(env.Sandbox, sessionId);
+        const processes = await sandbox.listProcesses();
+        const procInfo = [];
+        for (const p of processes) {
+          const logs = await sandbox.getProcessLogs(p.id);
+          procInfo.push({ id: p.id, status: p.status, command: p.command, logs });
+        }
+        return json(200, { processes: procInfo });
+      }
+
+      // POST /sessions/:id/exec — run command in sandbox
+      const execMatch = url.pathname.match(/^\/sessions\/([^/]+)\/exec$/);
+      if (request.method === "POST" && execMatch) {
+        const sessionId = execMatch[1];
+        const body = (await request.json()) as { command?: string };
+        if (!body.command) {
+          return json(400, { error: "command is required" });
+        }
+        const sandbox = getSandbox(env.Sandbox, sessionId);
+        const result = await sandbox.exec(body.command);
+        return json(200, result);
       }
 
       // DELETE /sessions/:id — destroy session

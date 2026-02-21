@@ -1,11 +1,14 @@
 // Shared type definitions for claude-swarm (Cloudflare Sandbox)
 
+import type { Sandbox } from "@cloudflare/sandbox";
+
 export type AgentStatus = "running" | "done" | "error";
 
 // Worker environment bindings (from wrangler.toml)
 export interface Env {
-  Sandbox: DurableObjectNamespace;
+  Sandbox: DurableObjectNamespace<Sandbox>;
   ANTHROPIC_API_KEY: string;
+  ANTHROPIC_BASE_URL?: string;
 }
 
 // A single conversation turn (maintained in agent memory)

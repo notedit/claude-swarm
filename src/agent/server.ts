@@ -1,12 +1,13 @@
 // Agent HTTP server — runs inside the Cloudflare Sandbox container.
-// Provides a persistent HTTP interface for multi-turn conversations.
+// Provides an async HTTP interface for multi-turn conversations.
 //
-// The Worker forwards requests via sandbox.fetch() to this server.
-// Conversation history is maintained in memory across turns.
+// The Worker sends messages which are queued and processed asynchronously.
+// Results are retrieved via polling.
 
-import { createServer, IncomingMessage, ServerResponse } from "http";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { config } from "../config";
+import { config } from "../config.js";
 
 const PORT = parseInt(process.env.PORT ?? "8080", 10);
 
@@ -19,104 +20,125 @@ interface Turn {
 // In-memory conversation history (persists across turns while sandbox is alive)
 const history: Turn[] = [];
 
-const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-  try {
-    // POST /message — process a user message
-    if (req.method === "POST" && req.url === "/message") {
-      const body = await readBody(req);
-      const { content } = JSON.parse(body) as { content: string };
+// Processing state
+let processing = false;
+let lastError: string | null = null;
 
-      if (!content) {
-        respond(res, 400, { error: "content is required" });
-        return;
-      }
+const app = new Hono();
 
-      console.log(`[agent] processing message (history: ${history.length} turns)`);
+// POST /message — queue a user message for async processing
+app.post("/message", async (c) => {
+  const { content } = await c.req.json<{ content: string }>();
 
-      // Add user message to history
-      history.push({
-        role: "user",
-        content,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Build prompt with conversation context
-      const prompt = buildPrompt(history);
-
-      // Call Claude Agent SDK
-      let result = "";
-      for await (const message of query({
-        prompt,
-        options: {
-          allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-          permissionMode: "bypassPermissions",
-          maxTurns: config.maxTurns,
-        },
-      })) {
-        if ("result" in message) {
-          result = message.result as string;
-        }
-      }
-
-      // Add assistant response to history
-      history.push({
-        role: "assistant",
-        content: result,
-        timestamp: new Date().toISOString(),
-      });
-
-      console.log(`[agent] done (total turns: ${history.length})`);
-      respond(res, 200, { role: "assistant", content: result });
-      return;
-    }
-
-    // GET /messages — return full conversation history
-    if (req.method === "GET" && req.url === "/messages") {
-      respond(res, 200, { history });
-      return;
-    }
-
-    // GET /health — health check
-    if (req.method === "GET" && req.url === "/health") {
-      respond(res, 200, { status: "ok", turns: history.length });
-      return;
-    }
-
-    respond(res, 404, { error: "not found" });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("[agent] error:", message);
-    respond(res, 500, { error: message });
+  if (!content) {
+    return c.json({ error: "content is required" }, 400);
   }
+
+  if (processing) {
+    return c.json({ error: "already processing a message" }, 409);
+  }
+
+  console.log(`[agent] queuing message (history: ${history.length} turns)`);
+
+  // Add user message to history
+  history.push({
+    role: "user",
+    content,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Start async processing
+  processing = true;
+  lastError = null;
+  processMessage().catch((err) => {
+    console.error("[agent] processing error:", err);
+    lastError = err instanceof Error ? err.message : String(err);
+    processing = false;
+  });
+
+  // Return immediately
+  return c.json({
+    status: "processing",
+    message_index: history.length - 1,
+  });
 });
 
-server.listen(PORT, () => {
+// GET /status — check processing status and get latest result
+app.get("/status", (c) => {
+  if (processing) {
+    return c.json({ status: "processing", turns: history.length });
+  }
+
+  if (lastError) {
+    return c.json({ status: "error", error: lastError, turns: history.length });
+  }
+
+  // Return the last assistant message if available
+  const lastTurn = history[history.length - 1];
+  if (lastTurn?.role === "assistant") {
+    return c.json({
+      status: "done",
+      role: "assistant",
+      content: lastTurn.content,
+      turns: history.length,
+    });
+  }
+
+  return c.json({ status: "idle", turns: history.length });
+});
+
+// GET /messages — return full conversation history
+app.get("/messages", (c) => {
+  return c.json({ history });
+});
+
+// GET /health — health check
+app.get("/health", (c) => {
+  return c.json({ status: "ok", turns: history.length, processing });
+});
+
+// Start server
+serve({ fetch: app.fetch, port: PORT }, () => {
   console.log(`[agent] server listening on port ${PORT}`);
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
-  });
-}
+async function processMessage(): Promise<void> {
+  const prompt = buildPrompt(history);
 
-function respond(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(body));
+  console.log("[agent] calling Claude SDK...");
+
+  let result = "";
+  for await (const message of query({
+    prompt,
+    options: {
+      allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+      permissionMode: "bypassPermissions",
+      maxTurns: config.maxTurns,
+    },
+  })) {
+    if ("result" in message) {
+      result = message.result as string;
+    }
+  }
+
+  // Add assistant response to history
+  history.push({
+    role: "assistant",
+    content: result,
+    timestamp: new Date().toISOString(),
+  });
+
+  processing = false;
+  console.log(`[agent] done (total turns: ${history.length})`);
 }
 
 function buildPrompt(turns: Turn[]): string {
   if (turns.length <= 1) {
-    // First message, no history context needed
     return turns[turns.length - 1].content;
   }
 
-  // Include all previous turns as context, last user message is the current prompt
   const previous = turns.slice(0, -1);
   const current = turns[turns.length - 1];
 
